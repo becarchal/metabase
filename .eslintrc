@@ -23,6 +23,7 @@
         "no-mixed-spaces-and-tabs": 0,
         "no-alert": 0,
         "no-console": 0,
+        "no-debugger":0,
         "dot-notation": 0,
         "space-unary-ops": 0,
         "semi": 0,
