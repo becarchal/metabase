@@ -1,0 +1,632 @@
+(ns metabase.driver.odata
+  (:require [clojure
+             [set :as set]
+             [string :as str]
+             [walk :as walk]]
+            [clojure.tools.logging :as log]
+            [cheshire.core :as json]
+            [clj-http.client :as client]
+            [honeysql
+             [core :as hsql]
+             [helpers :as h]]
+            [metabase
+             [config :as config]
+             [driver :as driver]
+             [util :as u]]
+            [metabase.util.ssh :as ssh]
+            [metabase.driver
+             [generic-sql :as sql]
+             [google :as google]]
+            [metabase.driver.generic-sql.query-processor :as sqlqp]
+            [metabase.driver.generic-sql.util.unprepare :as unprepare]
+            [metabase.models
+             [database :refer [Database]]
+             [field :as field]
+             [table :as table]]
+            [metabase.query-processor.util :as qputil]
+            [metabase.util.honeysql-extensions :as hx]
+            [toucan.db :as db])
+  (:import com.google.api.client.googleapis.auth.oauth2.GoogleCredential
+           [com.google.api.services.bigquery Bigquery Bigquery$Builder BigqueryScopes]
+           [com.google.api.services.bigquery.model QueryRequest QueryResponse Table TableCell TableFieldSchema
+                                                   TableList TableList$Tables TableReference TableRow TableSchema]
+           [java.util Collections Date]
+           [metabase.query_processor.interface DateTimeValue Value]))
+
+(defrecord OdataDriver []
+  clojure.lang.Named
+  (getName [_] "Odata"))
+
+
+;;; ----------------------------------------------------- Client -----------------------------------------------------
+
+(defn- ^Bigquery credential->client [^GoogleCredential credential]
+  (.build (doto (Bigquery$Builder. google/http-transport google/json-factory credential)
+            (.setApplicationName google/application-name))))
+
+(def ^:private ^{:arglists '([database])} ^GoogleCredential database->credential
+  (partial google/database->credential (Collections/singleton BigqueryScopes/BIGQUERY)))
+
+(def ^:private ^{:arglists '([database])} ^Bigquery database->client
+  (comp credential->client database->credential))
+
+
+;;; ------------------------------------------------------ Etc. ------------------------------------------------------
+
+;;; ### Request helper fns
+
+(defn- details->url
+  "Helper for building a Druid URL.
+
+    (details->url {:host \"http://localhost\", :port 8082} \"druid/v2\") -> \"http://localhost:8082/druid/v2\""
+  [{:keys [project-url table-name]} & query]
+  {:pre [(string? project-url) (string? table-name)]}
+  (let [vecroll (str/split project-url #"\?")]
+    (apply str (get vecroll 0) table-name "?" (get vecroll 1))))
+
+(defn- do-request
+  "Perform a JSON request using REQUEST-FN against URL.
+   Tho
+
+     (do-request http/get \"http://my-json-api.net\")"
+  [request-fn url & {:as options}]
+  {:pre [(fn? request-fn) (string? url)]}
+  (let [options               (cond-> (merge {:content-type "application/json"} options)
+                                      (:body options) (update :body json/generate-string))
+        {:keys [status body]} (request-fn url options)]
+    (when (not= status 200)
+      (throw (Exception. (format "Error [%d]: %s" status body))))
+    (try (json/parse-string body keyword)
+         (catch Throwable _
+           (throw (Exception. (str "Failed to parse body: " body)))))))
+
+(def ^:private ^{:arglists '([url & {:as options}])} GET  (partial do-request client/get))
+(def ^:private ^{:arglists '([url & {:as options}])} POST (partial do-request client/post))
+
+;;; ### Misc. Driver Fns
+
+(defn- can-connect? [driver details-map]
+  "检查driver是否可连接"
+  {:pre [(map? details-map)]}
+  (ssh/with-ssh-tunnel [details-with-tunnel details-map]
+                       (let [{:keys [project-url client-id client-secret]} details-with-tunnel
+                             {:keys [status body]} (client/get project-url {:basic-auth [(if (or (nil? client-id) (nil? client-secret)) "" client-id)
+                                                                                         (if (or (nil? client-id) (nil? client-secret)) "" client-secret)
+                                                                                         ]})
+                             ]
+                         ; check whether we can connect by project-url. If that succeeds we're odata
+                         (boolean (= 200 status)))))
+
+;;; ### Query Processing
+
+;(defn- do-query [details table-name & query]
+;  {:pre [(map? query)]}
+;  (ssh/with-ssh-tunnel [details-with-tunnel details]
+;
+;                       (let [{:keys [project-url client-id client-secret]} details-with-tunnel]
+;                          (try (vec (GET ((details->url project-url table-name query) {:basic-auth [(if (or (nil? client-id) (nil? client-secret)) "" client-id)
+;                                                                     (if (or (nil? client-id) (nil? client-secret)) "" client-secret)
+;                                                                     ]
+;                                                       })))
+;                            (catch Throwable e
+;                              ;; try to extract the error
+;                              (let [message (or (u/ignore-exceptions
+;                                                  (:error (json/parse-string (:body (:object (ex-data e))) keyword)))
+;                                                (.getMessage e))]
+;                                (log/error (u/format-color 'red "Error running query:\n%s" message))
+;                                ;; Re-throw a new exception with `message` set to the extracted message
+;                                (throw (Exception. message e))))))
+;                       ))
+;
+;
+;;;; ### Sync
+
+;(defn- do-segment-metadata-query [details table-name]
+;  (do-query details table-name))
+;
+;(defn- druid-type->base-type [field-type]
+;  (case field-type
+;    "STRING"      :type/Text
+;    "FLOAT"       :type/Float
+;    "LONG"        :type/Integer
+;    "hyperUnique" :type/DruidHyperUnique
+;    :type/Float))
+;
+;(defn- describe-table-field [field-name {field-type :type, :as info}]
+;  ;; all dimensions are Strings, and all metrics as JS Numbers, I think (?)
+;  ;; string-encoded booleans + dates are treated as strings (!)
+;  {:name          (name field-name)
+;   :base-type     (druid-type->base-type field-type)
+;   :database-type field-type})
+
+
+(defn- describe-database [database]
+  "获取数据表list"
+  {:pre [(map? (:details database))]}
+  (let [{:keys [project-url client-id client-secret]} (:details database)
+        results (:body (client/get project-url {:basic-auth [(if (or (nil? client-id) (nil? client-secret)) "" client-id)
+                                                          (if (or (nil? client-id) (nil? client-secret)) "" client-secret)
+                                                          ]}))
+        body (json/parse-string results true)
+        ]
+    (println {:tables (set (for [item (:value body)]
+                             {:schema nil, :name (item :name)}))} "odaddddsource")
+    {:tables (set (for [table-name (:value body)]
+                    {:schema nil, :name (:name table-name)}))}
+    ))
+
+(defn- ^Table get-table
+  ([{{:keys [project-id dataset-id]} :details, :as database} table-id]
+   (get-table (database->client database) project-id dataset-id table-id))
+
+  ([^Bigquery client, ^String project-id, ^String dataset-id, ^String table-id]
+   {:pre [client (seq project-id) (seq dataset-id) (seq table-id)]}
+   (google/execute (.get (.tables client) project-id dataset-id table-id))))
+
+(defn- bigquery-type->base-type [field-type]
+  (case field-type
+    "BOOLEAN"   :type/Boolean
+    "FLOAT"     :type/Float
+    "INTEGER"   :type/Integer
+    "RECORD"    :type/Dictionary ; RECORD -> field has a nested schema
+    "STRING"    :type/Text
+    "DATE"      :type/Date
+    "DATETIME"  :type/DateTime
+    "TIMESTAMP" :type/DateTime
+    :type/*))
+
+(defn- table-schema->metabase-field-info [^TableSchema schema]
+  (for [^TableFieldSchema field (.getFields schema)]
+    {:name          (.getName field)
+     :database-type (.getType field)
+     :base-type     (bigquery-type->base-type (.getType field))}))
+
+;(defn- describe-table [database {table-name :name}]
+;  {:schema nil
+;   :name   table-name
+;   :fields (set (table-schema->metabase-field-info (.getSchema (get-table database table-name))))})
+
+;(defn- describe-table [database table]
+;  (ssh/with-ssh-tunnel [details-with-tunnel (:details database)]
+;     (let [{:keys [columns]} (first (do-segment-metadata-query details-with-tunnel (:name table)))]
+;       ;{:schema nil
+;       ; :name   (:name table)
+;       ; :fields (set (concat
+;       ;                ;; every Odata table is an event stream w/ a timestamp field
+;       ;                [{:name          "timestamp"
+;       ;                  :database-type "timestamp"
+;       ;                  :base-type     :type/DateTime
+;       ;                  :pk?           true}]
+;       ;                (for [[field-name field-info] (dissoc columns :__time)]
+;       ;                  (describe-table-field field-name field-info))))}
+;       )))
+
+
+(def ^:private ^:const ^Integer query-timeout-seconds 60)
+
+(defn- ^QueryResponse execute-bigquery
+  ([{{:keys [project-id]} :details, :as database} query-string]
+   (execute-bigquery (database->client database) project-id query-string))
+
+  ([^Bigquery client, ^String project-id, ^String query-string]
+   {:pre [client (seq project-id) (seq query-string)]}
+   (let [request (doto (QueryRequest.)
+                   (.setTimeoutMs (* query-timeout-seconds 1000))
+                   ;; if the query contains a `#standardSQL` directive then use Standard SQL instead of legacy SQL
+                   (.setUseLegacySql (not (str/includes? (str/lower-case query-string) "#standardsql")))
+                   (.setQuery query-string))]
+     (google/execute (.query (.jobs client) project-id request)))))
+
+(def ^:private ^java.util.TimeZone default-timezone
+  (java.util.TimeZone/getDefault))
+
+(defn- parse-timestamp-str [s]
+  ;; Timestamp strings either come back as ISO-8601 strings or Unix timestamps in µs, e.g. "1.3963104E9"
+  (or
+    (u/->Timestamp s)
+    ;; If parsing as ISO-8601 fails parse as a double then convert to ms. Add the appropriate number of milliseconds to
+    ;; the number to convert it to the local timezone. We do this because the dates come back in UTC but we want the
+    ;; grouping to match the local time (HUH?) This gives us the same results as the other
+    ;; `has-questionable-timezone-support?` drivers. Not sure if this is actually desirable, but if it's not, it
+    ;; probably means all of those other drivers are doing it wrong
+    (u/->Timestamp (- (* (Double/parseDouble s) 1000)
+                      (.getDSTSavings default-timezone)
+                      (.getRawOffset  default-timezone)))))
+
+(def ^:private type->parser
+  "Functions that should be used to coerce string values in responses to the appropriate type for their column."
+  {"BOOLEAN"   #(Boolean/parseBoolean %)
+   "FLOAT"     #(Double/parseDouble %)
+   "INTEGER"   #(Long/parseLong %)
+   "RECORD"    identity
+   "STRING"    identity
+   "DATE"      parse-timestamp-str
+   "DATETIME"  parse-timestamp-str
+   "TIMESTAMP" parse-timestamp-str})
+
+(defn- post-process-native
+  ([^QueryResponse response]
+   (post-process-native response query-timeout-seconds))
+  ([^QueryResponse response, ^Integer timeout-seconds]
+   (if-not (.getJobComplete response)
+     ;; 99% of the time by the time this is called `.getJobComplete` will return `true`. On the off chance it doesn't,
+     ;; wait a few seconds for the job to finish.
+     (do
+       (when (zero? timeout-seconds)
+         (throw (ex-info "Query timed out." (into {} response))))
+       (Thread/sleep 1000)
+       (post-process-native response (dec timeout-seconds)))
+     ;; Otherwise the job *is* complete
+     (let [^TableSchema schema (.getSchema response)
+           parsers             (for [^TableFieldSchema field (.getFields schema)]
+                                 (type->parser (.getType field)))
+           columns             (for [column (table-schema->metabase-field-info schema)]
+                                 (set/rename-keys column {:base-type :base_type}))]
+       {:columns (map :name columns)
+        :cols    columns
+        :rows    (for [^TableRow row (.getRows response)]
+                   (for [[^TableCell cell, parser] (partition 2 (interleave (.getF row) parsers))]
+                     (when-let [v (.getV cell)]
+                       ;; There is a weird error where everything that *should* be NULL comes back as an Object.
+                       ;; See https://jira.talendforge.org/browse/TBD-1592
+                       ;; Everything else comes back as a String luckily so we can proceed normally.
+                       (when-not (= (class v) Object)
+                         (parser v)))))}))))
+
+(defn- process-native* [database query-string]
+  ;; automatically retry the query if it times out or otherwise fails. This is on top of the auto-retry added by
+  ;; `execute` so operations going through `process-native*` may be retried up to 3 times.
+  (u/auto-retry 1
+                (post-process-native (execute-bigquery database query-string))))
+
+
+;;; # Generic SQL Driver Methods
+
+(defn- date-add [unit timestamp interval]
+  (hsql/call :date_add timestamp interval (hx/literal unit)))
+
+;; microseconds = unix timestamp in microseconds. Most Odata functions like strftime require timestamps in this
+;; format
+
+(def ^:private ->microseconds (partial hsql/call :timestamp_to_usec))
+
+(defn- microseconds->str [format-str µs]
+  (hsql/call :strftime_utc_usec µs (hx/literal format-str)))
+
+(defn- trunc-with-format [format-str timestamp]
+  (hx/->timestamp (microseconds->str format-str (->microseconds timestamp))))
+
+(defn- date [unit expr]
+  {:pre [expr]}
+  (case unit
+    :default         expr
+    :minute          (trunc-with-format "%Y-%m-%d %H:%M:00" expr)
+    :minute-of-hour  (hx/minute expr)
+    :hour            (trunc-with-format "%Y-%m-%d %H:00:00" expr)
+    :hour-of-day     (hx/hour expr)
+    :day             (hx/->timestamp (hsql/call :date expr))
+    :day-of-week     (hsql/call :dayofweek expr)
+    :day-of-month    (hsql/call :day expr)
+    :day-of-year     (hsql/call :dayofyear expr)
+    :week            (date-add :day (date :day expr) (hx/- 1 (date :day-of-week expr)))
+    :week-of-year    (hx/week expr)
+    :month           (trunc-with-format "%Y-%m-01" expr)
+    :month-of-year   (hx/month expr)
+    :quarter         (date-add :month
+                               (trunc-with-format "%Y-01-01" expr)
+                               (hx/* (hx/dec (date :quarter-of-year expr))
+                                     3))
+    :quarter-of-year (hx/quarter expr)
+    :year            (hx/year expr)))
+
+(defn- unix-timestamp->timestamp [expr seconds-or-milliseconds]
+  (case seconds-or-milliseconds
+    :seconds      (hsql/call :sec_to_timestamp  expr)
+    :milliseconds (hsql/call :msec_to_timestamp expr)))
+
+
+;;; # Query Processing
+
+(declare driver)
+
+;; Make the dataset-id the "schema" of every field or table in the query because otherwise Odata can't figure out
+;; where things is from
+(defn- qualify-fields-and-tables-with-dataset-id [{{{:keys [dataset-id]} :details} :database, :as query}]
+  (walk/postwalk (fn [x]
+                   (cond
+                     ;; TODO - it is inconvenient that we use different keys for `schema` across different classes. We
+                     ;; should one day refactor to use the same key everywhere.
+                     (instance? metabase.query_processor.interface.Field x)     (assoc x :schema-name dataset-id)
+                     (instance? metabase.query_processor.interface.JoinTable x) (assoc x :schema      dataset-id)
+                     :else                                                      x))
+                 (assoc-in query [:query :source-table :schema] dataset-id)))
+
+(defn- honeysql-form [outer-query]
+  (sqlqp/build-honeysql-form driver (qualify-fields-and-tables-with-dataset-id outer-query)))
+
+(defn- honeysql-form->sql ^String [honeysql-form]
+  {:pre [(map? honeysql-form)]}
+  ;; replace identifiers like [shakespeare].[word] with ones like [shakespeare.word] since that's hat Odata expects
+  (let [[sql & args] (sql/honeysql-form->sql+args driver honeysql-form)
+        sql          (str/replace (hx/unescape-dots sql) #"\]\.\[" ".")]
+    (assert (empty? args)
+            "Odata statements can't be parameterized!")
+    sql))
+
+(defn- post-process-mbql [dataset-id table-name {:keys [columns rows]}]
+  ;; Since we don't alias column names the come back like "veryNiceDataset_shakepeare_corpus". Strip off the dataset
+  ;; and table IDs
+  (let [demangle-name (u/rpartial str/replace (re-pattern (str \^ dataset-id \_ table-name \_)) "")
+        columns       (for [column columns]
+                        (keyword (demangle-name column)))
+        rows          (for [row rows]
+                        (zipmap columns row))
+        columns       (vec (keys (first rows)))]
+    {:columns columns
+     :rows    (for [row rows]
+                (mapv row columns))}))
+
+(defn- mbql->native [{{{:keys [dataset-id]} :details, :as database} :database, {{table-name :name} :source-table} :query, :as outer-query}]
+  {:pre [(map? database) (seq dataset-id) (seq table-name)]}
+  (binding [sqlqp/*query* outer-query]
+    (let [honeysql-form (honeysql-form outer-query)
+          sql           (honeysql-form->sql honeysql-form)]
+      {:query      sql
+       :table-name table-name
+       :mbql?      true})))
+
+(defn- execute-query [{{{:keys [dataset-id]} :details, :as database} :database, {sql :query, params :params, :keys [table-name mbql?]} :native, :as outer-query}]
+  (let [sql     (str "-- " (qputil/query->remark outer-query) "\n" (if (seq params)
+                                                                     (unprepare/unprepare (cons sql params))
+                                                                     sql))
+        results (process-native* database sql)
+        results (if mbql?
+                  (post-process-mbql dataset-id table-name results)
+                  (update results :columns (partial map keyword)))]
+    (assoc results :annotate? mbql?)))
+
+;(defn- execute-query [{{{:keys [dataset-id]} :details, :as database} :database, {sql :query, params :params, :keys [table-name mbql?]} :native, :as outer-query}]
+;  (let [sql     (str "-- " (qputil/query->remark outer-query) "\n" (if (seq params)
+;                                                                     (unprepare/unprepare (cons sql params))
+;                                                                     sql))
+;        results (process-native* database sql)
+;        results (if mbql?
+;                  (post-process-mbql dataset-id table-name results)
+;                  (update results :columns (partial map keyword)))]
+;    (assoc results :annotate? mbql?)))
+
+
+;; These provide implementations of `->honeysql` that prevents HoneySQL from converting forms to prepared
+;; statement parameters (`?`)
+(defmethod sqlqp/->honeysql [OdataDriver String]
+  [_ s]
+  ;; TODO - what happens if `s` contains single-quotes? Shouldn't we be escaping them somehow?
+  (hx/literal s))
+
+(defmethod sqlqp/->honeysql [OdataDriver Boolean]
+  [_ bool]
+  (hsql/raw (if bool "TRUE" "FALSE")))
+
+(defmethod sqlqp/->honeysql [OdataDriver Date]
+  [_ date]
+  (hsql/call :timestamp (hx/literal (u/date->iso-8601 date))))
+
+
+(defn- field->alias [{:keys [^String schema-name, ^String field-name, ^String table-name, ^Integer index, field], :as this}]
+  {:pre [(map? this) (or field
+                         index
+                         (and (seq schema-name) (seq field-name) (seq table-name))
+                         (log/error "Don't know how to alias: " this))]}
+  (cond
+    field (recur field) ; type/DateTime
+    index (name (let [{{aggregations :aggregation} :query} sqlqp/*query*
+                      {ag-type :aggregation-type}          (nth aggregations index)]
+                  (if (= ag-type :distinct)
+                    :count
+                    ag-type)))
+    :else (str schema-name \. table-name \. field-name)))
+
+;; TODO - Making 2 DB calls for each field to fetch its dataset is inefficient and makes me cry, but this method is
+;; currently only used for SQL params so it's not a huge deal at this point
+(defn- field->identifier [{table-id :table_id, :as field}]
+  (let [db-id   (db/select-one-field :db_id 'Table :id table-id)
+        dataset (:dataset-id (db/select-one-field :details Database, :id db-id))]
+    (hsql/raw (apply format "[%s.%s.%s]" dataset (field/qualified-name-components field)))))
+
+;; We have to override the default SQL implementations of breakout and order-by because Odata propogates casting
+;; functions in SELECT
+;; BAD:
+;; SELECT msec_to_timestamp([sad_toucan_incidents.incidents.timestamp]) AS [sad_toucan_incidents.incidents.timestamp],
+;;       count(*) AS [count]
+;; FROM [sad_toucan_incidents.incidents]
+;; GROUP BY msec_to_timestamp([sad_toucan_incidents.incidents.timestamp])
+;; ORDER BY msec_to_timestamp([sad_toucan_incidents.incidents.timestamp]) ASC
+;; LIMIT 10
+;;
+;; GOOD:
+;; SELECT msec_to_timestamp([sad_toucan_incidents.incidents.timestamp]) AS [sad_toucan_incidents.incidents.timestamp],
+;;        count(*) AS [count]
+;; FROM [sad_toucan_incidents.incidents]
+;; GROUP BY [sad_toucan_incidents.incidents.timestamp]
+;; ORDER BY [sad_toucan_incidents.incidents.timestamp] ASC
+;; LIMIT 10
+
+(defn- deduplicate-aliases
+  "Given a sequence of aliases, return a sequence where duplicate aliases have been appropriately suffixed.
+
+     (deduplicate-aliases [\"sum\" \"count\" \"sum\" \"avg\" \"sum\" \"min\"])
+     ;; -> [\"sum\" \"count\" \"sum_2\" \"avg\" \"sum_3\" \"min\"]"
+  [aliases]
+  (loop [acc [], alias->use-count {}, [alias & more, :as aliases] aliases]
+    (let [use-count (get alias->use-count alias)]
+      (cond
+        (empty? aliases) acc
+        (not alias)      (recur (conj acc alias) alias->use-count more)
+        (not use-count)  (recur (conj acc alias) (assoc alias->use-count alias 1) more)
+        :else            (let [new-count (inc use-count)
+                               new-alias (str alias "_" new-count)]
+                           (recur (conj acc new-alias) (assoc alias->use-count alias new-count, new-alias 1) more))))))
+
+(defn- select-subclauses->aliases
+  "Return a vector of aliases used in HoneySQL SELECT-SUBCLAUSES.
+   (For clauses that aren't aliased, `nil` is returned as a placeholder)."
+  [select-subclauses]
+  (for [subclause select-subclauses]
+    (when (and (vector? subclause)
+               (= 2 (count subclause)))
+      (second subclause))))
+
+(defn update-select-subclause-aliases
+  "Given a vector of HoneySQL SELECT-SUBCLAUSES and a vector of equal length of NEW-ALIASES,
+   return a new vector with combining the original `SELECT` subclauses with the new aliases.
+
+   Subclauses that are not aliased are not modified; they are given a placeholder of `nil` in the NEW-ALIASES vector.
+
+     (update-select-subclause-aliases [[:user_id \"user_id\"] :venue_id]
+                                      [\"user_id_2\" nil])
+     ;; -> [[:user_id \"user_id_2\"] :venue_id]"
+  [select-subclauses new-aliases]
+  (for [[subclause new-alias] (partition 2 (interleave select-subclauses new-aliases))]
+    (if-not new-alias
+      subclause
+      [(first subclause) new-alias])))
+
+(defn- deduplicate-select-aliases
+  "Replace duplicate aliases in SELECT-SUBCLAUSES with appropriately suffixed aliases.
+
+  Odata doesn't allow duplicate aliases in `SELECT` statements; a statement like `SELECT sum(x) AS sum, sum(y) AS
+  sum` is invalid. (See #4089) To work around this, we'll modify the HoneySQL aliases to make sure the same one isn't
+  used twice by suffixing duplicates appropriately.
+  (We'll generate SQL like `SELECT sum(x) AS sum, sum(y) AS sum_2` instead.)"
+  [select-subclauses]
+  (let [aliases (select-subclauses->aliases select-subclauses)
+        deduped (deduplicate-aliases aliases)]
+    (update-select-subclause-aliases select-subclauses deduped)))
+
+(defn- apply-aggregation
+  "Odata's implementation of `apply-aggregation` just hands off to the normal Generic SQL implementation, but calls
+  `deduplicate-select-aliases` on the results."
+  [driver honeysql-form query]
+  (-> (sqlqp/apply-aggregation driver honeysql-form query)
+      (update :select deduplicate-select-aliases)))
+
+
+(defn- field->breakout-identifier [field]
+  (hsql/raw (str \[ (field->alias field) \])))
+
+(defn- apply-breakout [driver honeysql-form {breakout-fields :breakout, fields-fields :fields}]
+  (-> honeysql-form
+      ;; Group by all the breakout fields
+      ((partial apply h/group)  (map field->breakout-identifier breakout-fields))
+      ;; Add fields form only for fields that weren't specified in :fields clause -- we don't want to include it
+      ;; twice, or HoneySQL will barf
+      ((partial apply h/merge-select) (for [field breakout-fields
+                                            :when (not (contains? (set fields-fields) field))]
+                                        (sqlqp/as driver (sqlqp/->honeysql driver field) field)))))
+
+(defn- apply-join-tables
+  "Copy of the Generic SQL implementation of `apply-join-tables`, but prepends schema (dataset-id) to join-alias."
+  [honeysql-form {join-tables :join-tables, {source-table-name :name, source-schema :schema} :source-table}]
+  (loop [honeysql-form honeysql-form, [{:keys [table-name pk-field source-field schema join-alias]} & more] join-tables]
+    (let [honeysql-form (h/merge-left-join honeysql-form
+                                           [(hx/qualify-and-escape-dots schema table-name) (hx/qualify-and-escape-dots schema join-alias)]
+                                           [:= (hx/qualify-and-escape-dots source-schema source-table-name (:field-name source-field))
+                                            (hx/qualify-and-escape-dots schema join-alias               (:field-name pk-field))])]
+      (if (seq more)
+        (recur honeysql-form more)
+        honeysql-form))))
+
+(defn- apply-order-by [honeysql-form {subclauses :order-by}]
+  (loop [honeysql-form honeysql-form, [{:keys [field direction]} & more] subclauses]
+    (let [honeysql-form (h/merge-order-by honeysql-form [(field->breakout-identifier field) (case direction
+                                                                                              :ascending  :asc
+                                                                                              :descending :desc)])]
+      (if (seq more)
+        (recur honeysql-form more)
+        honeysql-form))))
+
+(defn- string-length-fn [field-key]
+  (hsql/call :length field-key))
+
+;; From the dox: Fields must contain only letters, numbers, and underscores, start with a letter or underscore, and be
+;; at most 128 characters long.
+(defn- format-custom-field-name ^String [^String custom-field-name]
+  (str/join (take 128 (-> (str/trim custom-field-name)
+                          (str/replace #"[^\w\d_]" "_")
+                          (str/replace #"(^\d)" "_$1")))))
+
+(defn- date-interval [driver unit amount]
+  (sqlqp/->honeysql driver (u/relative-date unit amount)))
+
+
+;; Odata doesn't return a timezone with it's time strings as it's always UTC, JodaTime parsing also defaults to UTC
+(def ^:private odata-date-formatters (driver/create-db-time-formatters "yyyy-MM-dd HH:mm:ss.SSSSSS"))
+(def ^:private odata-db-time-query "select CAST(CURRENT_TIMESTAMP() AS STRING)")
+
+(def ^:private driver (OdataDriver.))
+
+(u/strict-extend OdataDriver
+                 sql/ISQLDriver
+                 (merge (sql/ISQLDriverDefaultsMixin)
+                        {:apply-aggregation         apply-aggregation
+                         :apply-breakout            apply-breakout
+                         :apply-join-tables         (u/drop-first-arg apply-join-tables)
+                         :apply-order-by            (u/drop-first-arg apply-order-by)
+                         ;; these two are actually not applicable since we don't use JDBC
+                         :column->base-type         (constantly nil)
+                         :connection-details->spec  (constantly nil)
+                         :current-datetime-fn       (constantly :%current_timestamp)
+                         :date                      (u/drop-first-arg date)
+                         :field->alias              (u/drop-first-arg field->alias)
+                         :field->identifier         (u/drop-first-arg field->identifier)
+                         ;; we want identifiers quoted [like].[this] initially (we have to convert them to [like.this] before
+                         ;; executing)
+                         :quote-style               (constantly :sqlserver)
+                         :string-length-fn          (u/drop-first-arg string-length-fn)
+                         :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)})
+
+                 driver/IDriver
+                 (merge driver/IDriverDefaultsMixin
+                        {
+                         :can-connect?             can-connect?
+                         :date-interval            date-interval
+                         :describe-database        (u/drop-first-arg describe-database)
+                         :describe-table           (constantly nil)
+                         ;:describe-table           (u/drop-first-arg describe-table)
+                         :details-fields           (constantly [{:name         "project-url"
+                                                                 :display-name "Project Url"
+                                                                 :placeholder  "http://services.odata.org/V3/Northwind/Northwind.svc/"
+                                                                 :required     true}
+                                                                {:name         "client-id"
+                                                                 :display-name "Client ID"
+                                                                 :placeholder  "F999999"
+                                                                 :required     false}
+                                                                {:name         "client-secret"
+                                                                 :display-name "Client Secret"
+                                                                 :placeholder  "123456"
+                                                                 :required     false}
+                                                                ])
+                         :execute-query            (u/drop-first-arg execute-query)
+                         ;; Don't enable foreign keys when testing because Odata *doesn't* have a notion of foreign keys. Joins
+                         ;; are still allowed, which puts us in a weird position, however; people can manually specifiy "foreign key"
+                         ;; relationships in admin and everything should work correctly. Since we can't infer any "FK" relationships
+                         ;; during sync our normal FK tests are not appropriate for Odata, so they're disabled for the time being.
+                         ;; TODO - either write BigQuery-speciifc tests for FK functionality or add additional code to manually set
+                         ;; up these FK relationships for FK tables
+                         :features                 (constantly (set/union #{:basic-aggregations
+                                                                            :standard-deviation-aggregations
+                                                                            :native-parameters
+                                                                            :expression-aggregations
+                                                                            :binning}
+                                                                          (when-not config/is-test?
+                                                                            ;; during unit tests don't treat bigquery as having FK
+                                                                            ;; support
+                                                                            #{:foreign-keys})))
+                         :format-custom-field-name (u/drop-first-arg format-custom-field-name)
+                         :mbql->native             (u/drop-first-arg mbql->native)
+                         }))
+
+(defn -init-driver
+  "Register the Odata driver"
+  []
+  (driver/register-driver! :odata (OdataDriver.)))
